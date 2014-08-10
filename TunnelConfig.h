@@ -51,7 +51,7 @@ namespace tunnel
 			nextTunnelID = rnd.GenerateWord32 ();
 		}	
 
-		void SetReplyHop (TunnelHopConfig * replyFirstHop)
+		void SetReplyHop (const TunnelHopConfig * replyFirstHop)
 		{
 			nextRouter = replyFirstHop->router;
 			nextTunnelID = replyFirstHop->tunnelID;
@@ -89,7 +89,7 @@ namespace tunnel
 			
 
 			TunnelConfig (std::vector<const i2p::data::RouterInfo *> peers, 
-				TunnelConfig * replyTunnelConfig = 0) // replyTunnelConfig=0 means inbound
+				const TunnelConfig * replyTunnelConfig = nullptr) // replyTunnelConfig=nullptr means inbound
 			{
 				TunnelHopConfig * prev = nullptr;
 				for (auto it: peers)
@@ -192,6 +192,18 @@ namespace tunnel
 				}	
 				return newConfig;
 			}
+
+			TunnelConfig * Clone (const TunnelConfig * replyTunnelConfig = nullptr) const
+			{
+				std::vector<const i2p::data::RouterInfo *> peers;
+				TunnelHopConfig * hop = m_FirstHop;
+				while (hop)
+				{
+					peers.push_back (hop->router);
+					hop = hop->next;
+				}	
+				return new TunnelConfig (peers, replyTunnelConfig);
+			}	
 			
 		private:
 
