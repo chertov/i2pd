@@ -36,13 +36,16 @@ namespace stream
 	const size_t STREAMING_MTU = 1730;
 	const size_t MAX_PACKET_SIZE = 4096;
 	const size_t COMPRESSION_THRESHOLD_SIZE = 66;	
+	const int RESEND_TIMEOUT = 10; // in seconds
+	const int MAX_NUM_RESEND_ATTEMPTS = 5;	
 	
 	struct Packet
 	{
 		uint8_t buf[MAX_PACKET_SIZE];	
 		size_t len, offset;
-
-		Packet (): len (0), offset (0) {};
+		int numResendAttempts;
+		
+		Packet (): len (0), offset (0), numResendAttempts (0) {};
 		uint8_t * GetBuffer () { return buf + offset; };
 		size_t GetLength () const { return len - offset; };
 
@@ -51,6 +54,7 @@ namespace stream
 		uint32_t GetSeqn () const { return be32toh (*(uint32_t *)(buf + 8)); };
 		uint32_t GetAckThrough () const { return be32toh (*(uint32_t *)(buf + 12)); };
 		uint8_t GetNACKCount () const { return buf[16]; };
+		uint32_t GetNACK (int i) const { return be32toh (((uint32_t *)(buf + 17))[i]); };
 		const uint8_t * GetOption () const { return buf + 17 + GetNACKCount ()*4 + 3; }; // 3 = resendDelay + flags
 		uint16_t GetFlags () const { return be16toh (*(uint16_t *)(GetOption () - 2)); };
 		uint16_t GetOptionSize () const { return be16toh (*(uint16_t *)GetOption ()); };
@@ -58,6 +62,7 @@ namespace stream
 		const uint8_t * GetPayload () const { return GetOptionData () + GetOptionSize (); };
 
 		bool IsSYN () const { return GetFlags () & PACKET_FLAG_SYNCHRONIZE; };
+		bool IsNoAck () const { return GetFlags () & PACKET_FLAG_NO_ACK; };
 	};	
 
 	struct PacketCmp
@@ -98,10 +103,11 @@ namespace stream
 
 			void SendQuickAck ();
 			bool SendPacket (Packet * packet);
-			bool SendPacket (const uint8_t * buf, size_t len);
+			void SendPackets (const std::vector<Packet *>& packets);
 
 			void SavePacket (Packet * packet);
 			void ProcessPacket (Packet * packet);
+			void ProcessAck (Packet * packet);
 			size_t ConcatenatePackets (uint8_t * buf, size_t len);
 
 			void UpdateCurrentRemoteLease ();
@@ -109,6 +115,9 @@ namespace stream
 			template<typename Buffer, typename ReceiveHandler>
 			void HandleReceiveTimer (const boost::system::error_code& ecode, const Buffer& buffer, ReceiveHandler handler);
 
+			void ScheduleResend ();
+			void HandleResendTimer (const boost::system::error_code& ecode);
+			
 		private:
 
 			boost::asio::io_service& m_Service;
@@ -121,7 +130,8 @@ namespace stream
 			i2p::data::Lease m_CurrentRemoteLease;
 			std::queue<Packet *> m_ReceiveQueue;
 			std::set<Packet *, PacketCmp> m_SavedPackets;
-			boost::asio::deadline_timer m_ReceiveTimer;
+			std::set<Packet *, PacketCmp> m_SentPackets;
+			boost::asio::deadline_timer m_ReceiveTimer, m_ResendTimer;
 	};
 	
 	class StreamingDestination: public i2p::data::LocalDestination 

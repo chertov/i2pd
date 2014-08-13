@@ -21,7 +21,7 @@ namespace stream
 		const i2p::data::LeaseSet& remote): m_Service (service), m_SendStreamID (0), 
 		m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), m_IsOpen (false),  
 		m_LeaseSetUpdated (true), m_LocalDestination (local), 
-		m_RemoteLeaseSet (&remote), m_ReceiveTimer (m_Service)
+		m_RemoteLeaseSet (&remote), m_ReceiveTimer (m_Service), m_ResendTimer (m_Service)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 		UpdateCurrentRemoteLease ();
@@ -30,7 +30,7 @@ namespace stream
 	Stream::Stream (boost::asio::io_service& service, StreamingDestination * local):
 		m_Service (service), m_SendStreamID (0), m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), 
 		m_IsOpen (false), m_LeaseSetUpdated (true), m_LocalDestination (local),
-		m_RemoteLeaseSet (nullptr), m_ReceiveTimer (m_Service)
+		m_RemoteLeaseSet (nullptr), m_ReceiveTimer (m_Service), m_ResendTimer (m_Service)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 	}
@@ -38,6 +38,7 @@ namespace stream
 	Stream::~Stream ()
 	{
 		m_ReceiveTimer.cancel ();
+		m_ResendTimer.cancel ();
 		while (!m_ReceiveQueue.empty ())
 		{
 			auto packet = m_ReceiveQueue.front ();
@@ -46,6 +47,8 @@ namespace stream
 		}		
 		for (auto it: m_SavedPackets)
 			delete it;
+		for (auto it: m_SentPackets)
+			delete it;
 	}	
 		
 	void Stream::HandleNextPacket (Packet * packet)
@@ -53,6 +56,9 @@ namespace stream
 		if (!m_SendStreamID) 
 			m_SendStreamID = packet->GetReceiveStreamID (); 	
 
+		if (!packet->IsNoAck ()) // ack received
+			ProcessAck (packet);
+		
 		int32_t receivedSeqn = packet->GetSeqn ();
 		bool isSyn = packet->IsSYN ();
 		if (!receivedSeqn && !isSyn)
@@ -170,67 +176,121 @@ namespace stream
 			SendQuickAck (); // send ack for close explicitly?
 			m_IsOpen = false;
 			m_ReceiveTimer.cancel ();
+			m_ResendTimer.cancel ();
 		}
 	}	
+
+	void Stream::ProcessAck (Packet * packet)
+	{
+		uint32_t ackThrough = packet->GetAckThrough ();
+		int nackCount = packet->GetNACKCount ();
+		for (auto it = m_SentPackets.begin (); it != m_SentPackets.end ();)
+		{			
+			auto seqn = (*it)->GetSeqn ();
+			if (seqn <= ackThrough)
+			{
+				if (nackCount > 0)
+				{
+					bool nacked = false;
+					for (int i = 0; i < nackCount; i++)
+						if (seqn == packet->GetNACK (i))
+						{
+							nacked = true;
+							break;
+						}
+					if (nacked)
+					{
+						LogPrint ("Packet ", seqn, " NACK");
+						continue;
+					}	
+				}
+				auto sentPacket = *it;
+				LogPrint ("Packet ", seqn, " acknowledged");
+				m_SentPackets.erase (it++);
+				delete sentPacket;	
+			}
+			else
+				break;
+		}
+		if (m_SentPackets.empty ())
+			m_ResendTimer.cancel ();
+	}		
 		
 	size_t Stream::Send (const uint8_t * buf, size_t len, int timeout)
 	{
-		Packet * p = new Packet ();
-		uint8_t * packet = p->GetBuffer ();
-		// TODO: implement setters
-		size_t size = 0;
-		*(uint32_t *)(packet + size) = htobe32 (m_SendStreamID);
-		size += 4; // sendStreamID
-		*(uint32_t *)(packet + size) = htobe32 (m_RecvStreamID);
-		size += 4; // receiveStreamID
-		*(uint32_t *)(packet + size) = htobe32 (m_SequenceNumber++);
-		size += 4; // sequenceNum
-		*(uint32_t *)(packet + size) = 0; // TODO
-		size += 4; // ack Through
-		packet[size] = 0; 
-		size++; // NACK count
-		size++; // resend delay
-		if (!m_IsOpen)
-		{	
-			//  initial packet
-			m_IsOpen = true;
-			*(uint16_t *)(packet + size) = htobe16 (PACKET_FLAG_SYNCHRONIZE | 
-				PACKET_FLAG_FROM_INCLUDED | PACKET_FLAG_SIGNATURE_INCLUDED | 
-				PACKET_FLAG_MAX_PACKET_SIZE_INCLUDED | PACKET_FLAG_NO_ACK);
-			size += 2; // flags
-			*(uint16_t *)(packet + size) = htobe16 (i2p::data::DEFAULT_IDENTITY_SIZE + 40 + 2); // identity + signature + packet size
-			size += 2; // options size
-			memcpy (packet + size, &m_LocalDestination->GetIdentity (), i2p::data::DEFAULT_IDENTITY_SIZE); 
-			size += i2p::data::DEFAULT_IDENTITY_SIZE; // from
-			*(uint16_t *)(packet + size) = htobe16 (STREAMING_MTU);
-			size += 2; // max packet size
-			uint8_t * signature = packet + size; // set it later
-			memset (signature, 0, 40); // zeroes for now
-			size += 40; // signature		
-			memcpy (packet + size, buf, len); 
-			size += len; // payload
-			m_LocalDestination->Sign (packet, size, signature);
-		}	
-		else
+		bool isNoAck = m_LastReceivedSequenceNumber < 0; // first packet
+		while (len > 0)
 		{
-			// follow on packet
-			*(uint16_t *)(packet + size) = 0;
-			size += 2; // flags
-			*(uint16_t *)(packet + size) = 0; // no options
-			size += 2; // options size
-			memcpy (packet + size, buf, len); 
-			size += len; // payload
-		}	
-		p->len = size;
-		m_Service.post (boost::bind (&Stream::SendPacket, this, p));
-		
+			Packet * p = new Packet ();
+			uint8_t * packet = p->GetBuffer ();
+			// TODO: implement setters
+			size_t size = 0;
+			*(uint32_t *)(packet + size) = htobe32 (m_SendStreamID);
+			size += 4; // sendStreamID
+			*(uint32_t *)(packet + size) = htobe32 (m_RecvStreamID);
+			size += 4; // receiveStreamID
+			*(uint32_t *)(packet + size) = htobe32 (m_SequenceNumber++);
+			size += 4; // sequenceNum
+			if (isNoAck)			
+				*(uint32_t *)(packet + size) = htobe32 (m_LastReceivedSequenceNumber);
+			else
+				*(uint32_t *)(packet + size) = 0;
+			size += 4; // ack Through
+			packet[size] = 0; 
+			size++; // NACK count
+			size++; // resend delay
+			if (!m_IsOpen)
+			{	
+				//  initial packet
+				m_IsOpen = true;
+				uint16_t flags = PACKET_FLAG_SYNCHRONIZE | PACKET_FLAG_FROM_INCLUDED | 
+					PACKET_FLAG_SIGNATURE_INCLUDED | PACKET_FLAG_MAX_PACKET_SIZE_INCLUDED;
+				if (isNoAck) flags |= PACKET_FLAG_NO_ACK;
+				*(uint16_t *)(packet + size) = htobe16 (flags);
+				size += 2; // flags
+				*(uint16_t *)(packet + size) = htobe16 (i2p::data::DEFAULT_IDENTITY_SIZE + 40 + 2); // identity + signature + packet size
+				size += 2; // options size
+				memcpy (packet + size, &m_LocalDestination->GetIdentity (), i2p::data::DEFAULT_IDENTITY_SIZE); 
+				size += i2p::data::DEFAULT_IDENTITY_SIZE; // from
+				*(uint16_t *)(packet + size) = htobe16 (STREAMING_MTU);
+				size += 2; // max packet size
+				uint8_t * signature = packet + size; // set it later
+				memset (signature, 0, 40); // zeroes for now
+				size += 40; // signature
+				size_t sentLen = STREAMING_MTU - size;
+				if (len < sentLen) sentLen = len;		
+				memcpy (packet + size, buf, sentLen); 
+				buf += sentLen;
+				len -= sentLen;
+				size += sentLen; // payload
+				m_LocalDestination->Sign (packet, size, signature);
+			}	
+			else
+			{
+				// follow on packet
+				*(uint16_t *)(packet + size) = 0;
+				size += 2; // flags
+				*(uint16_t *)(packet + size) = 0; // no options
+				size += 2; // options size
+				size_t sentLen = STREAMING_MTU - size;
+				if (len < sentLen) sentLen = len;		
+				memcpy (packet + size, buf, sentLen); 
+				buf += sentLen;
+				len -= sentLen;
+				size += sentLen; // payload
+			}	
+			p->len = size;
+			m_Service.post (boost::bind (&Stream::SendPacket, this, p));
+		}
+
 		return len;
 	}	
 
 		
 	void Stream::SendQuickAck ()
 	{
-		uint8_t packet[MAX_PACKET_SIZE];
+		Packet p;
+		uint8_t * packet = p.GetBuffer ();	
 		size_t size = 0;
 		*(uint32_t *)(packet + size) = htobe32 (m_SendStreamID);
 		size += 4; // sendStreamID
@@ -247,9 +307,10 @@ namespace stream
 		size += 2; // flags
 		*(uint16_t *)(packet + size) = 0; // no options
 		size += 2; // options size
-		
-		if (SendPacket (packet, size))
-			LogPrint ("Quick Ack sent");
+		p.len = size;		
+
+		SendPackets (std::vector<Packet *> { &p });
+		LogPrint ("Quick Ack sent");
 	}	
 
 	void Stream::Close ()
@@ -309,36 +370,36 @@ namespace stream
 	{
 		if (packet)
 		{	
-			bool ret = SendPacket (packet->GetBuffer (), packet->GetLength ());
-			delete packet;
-			return ret;
+			SendPackets (std::vector<Packet *> { packet });
+			bool isEmpty = m_SentPackets.empty ();
+			m_SentPackets.insert (packet);
+			if (isEmpty)
+				ScheduleResend ();
+			return true;
 		}	
 		else
 			return false;
 	}	
 	
-	bool Stream::SendPacket (const uint8_t * buf, size_t len)
-	{	
+	void Stream::SendPackets (const std::vector<Packet *>& packets)
+	{
 		if (!m_RemoteLeaseSet)
 		{
 			UpdateCurrentRemoteLease ();	
 			if (!m_RemoteLeaseSet)
 			{
-				LogPrint ("Can't send packet. Missing remote LeaseSet");
-				return false;
+				LogPrint ("Can't send packets. Missing remote LeaseSet");
+				return;
 			}
 		}
 
 		I2NPMessage * leaseSet = nullptr;
-
 		if (m_LeaseSetUpdated)
 		{	
 			leaseSet = m_LocalDestination->GetLeaseSetMsg ();
 			m_LeaseSetUpdated = false;
 		}	
 
-		I2NPMessage * msg = i2p::garlic::routing.WrapMessage (*m_RemoteLeaseSet, 
-			CreateDataMessage (this, buf, len), leaseSet);
 		auto outboundTunnel = m_LocalDestination->GetTunnelPool ()->GetNextOutboundTunnel ();
 		if (outboundTunnel)
 		{
@@ -347,23 +408,58 @@ namespace stream
 				UpdateCurrentRemoteLease ();
 			if (ts < m_CurrentRemoteLease.endDate)
 			{	
-				outboundTunnel->SendTunnelDataMsg (m_CurrentRemoteLease.tunnelGateway, m_CurrentRemoteLease.tunnelID, msg);
-				return true;
+				std::vector<i2p::tunnel::TunnelMessageBlock> msgs;
+				for (auto it: packets)
+				{ 
+					auto msg = i2p::garlic::routing.WrapMessage (*m_RemoteLeaseSet, 
+						CreateDataMessage (this, it->GetBuffer (), it->GetLength ()), leaseSet);
+					msgs.push_back (i2p::tunnel::TunnelMessageBlock 
+								{ 
+									i2p::tunnel::eDeliveryTypeTunnel,
+									m_CurrentRemoteLease.tunnelGateway, m_CurrentRemoteLease.tunnelID,
+									msg
+								});	
+					leaseSet = nullptr; // send leaseSet only one time
+				}
+				outboundTunnel->SendTunnelDataMsg (msgs);
 			}	
 			else
-			{
 				LogPrint ("All leases are expired");
-				DeleteI2NPMessage (msg);
-			}	
 		}	
-		else
-		{	
+		else 
 			LogPrint ("No outbound tunnels in the pool");
-			DeleteI2NPMessage (msg);
-		}	
-		return false;
 	}
 
+	void Stream::ScheduleResend ()
+	{
+		m_ResendTimer.cancel ();
+		m_ResendTimer.expires_from_now (boost::posix_time::seconds(RESEND_TIMEOUT));
+		m_ResendTimer.async_wait (boost::bind (&Stream::HandleResendTimer,
+			this, boost::asio::placeholders::error));
+	}
+		
+	void Stream::HandleResendTimer (const boost::system::error_code& ecode)
+	{
+		if (ecode != boost::asio::error::operation_aborted)
+		{	
+			std::vector<Packet *> packets;
+			for (auto it : m_SentPackets)
+			{
+				it->numResendAttempts++;
+				if (it->numResendAttempts <= MAX_NUM_RESEND_ATTEMPTS)
+					packets.push_back (it);
+				else
+				{
+					Close ();
+					return;
+				}	
+			}	
+			if (packets.size () > 0)
+				SendPackets (packets);
+			ScheduleResend ();
+		}	
+	}	
+		
 	void Stream::UpdateCurrentRemoteLease ()
 	{
 		if (!m_RemoteLeaseSet)
