@@ -81,6 +81,7 @@ namespace ssu
 
 			void CreateAESandMacKey (const uint8_t * pubKey); 
 
+			void PostI2NPMessage (I2NPMessage * msg);
 			void ProcessMessage (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint); // call for established session
 			void ProcessSessionRequest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint);
 			void SendSessionRequest ();
@@ -98,7 +99,7 @@ namespace ssu
 			void Failed ();
 			void HandleConnectTimer (const boost::system::error_code& ecode);
 			void ProcessPeerTest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint);
-			void SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, uint8_t * introKey); // Charlie to Alice
+			void SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, uint8_t * introKey, bool toAddress = true); 
 			void ProcessData (uint8_t * buf, size_t len);		
 			void SendSesionDestroyed ();
 			void Send (uint8_t type, const uint8_t * payload, size_t len); // with session key
@@ -146,6 +147,7 @@ namespace ssu
 			SSUSession * GetSession (const i2p::data::RouterInfo * router, bool peerTest = false);
 			SSUSession * FindSession (const i2p::data::RouterInfo * router);
 			SSUSession * FindSession (const boost::asio::ip::udp::endpoint& e);
+			SSUSession * GetRandomEstablishedSession ();
 			void DeleteSession (SSUSession * session);
 			void DeleteAllSessions ();			
 
@@ -160,6 +162,9 @@ namespace ssu
 			void Run ();
 			void Receive ();
 			void HandleReceivedFrom (const boost::system::error_code& ecode, std::size_t bytes_transferred);
+
+			template<typename Filter>
+			SSUSession * GetRandomSession (Filter filter);
 
 		private:
 

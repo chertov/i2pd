@@ -215,16 +215,32 @@ namespace i2p
 		return m;
 	}	
 
-	I2NPMessage * CreateDatabaseStoreMsg (const i2p::data::LeaseSet * leaseSet)
+	I2NPMessage * CreateDatabaseStoreMsg (const i2p::data::LeaseSet * leaseSet,  uint32_t replyToken)
 	{
 		if (!leaseSet) return nullptr;
 		I2NPMessage * m = NewI2NPShortMessage ();
-		I2NPDatabaseStoreMsg * msg = (I2NPDatabaseStoreMsg *)m->GetPayload ();
+		uint8_t * payload = m->GetPayload ();	
+		I2NPDatabaseStoreMsg * msg = (I2NPDatabaseStoreMsg *)payload;
 		memcpy (msg->key, leaseSet->GetIdentHash (), 32);
 		msg->type = 1; // LeaseSet
-		msg->replyToken = 0;
-		memcpy (m->GetPayload () + sizeof (I2NPDatabaseStoreMsg), leaseSet->GetBuffer (), leaseSet->GetBufferLen ());
-		m->len += leaseSet->GetBufferLen () + sizeof (I2NPDatabaseStoreMsg);
+		msg->replyToken = htobe32 (replyToken);
+		size_t size = sizeof (I2NPDatabaseStoreMsg);
+		if (replyToken)
+		{
+			auto leases = leaseSet->GetNonExpiredLeases ();
+			if (leases.size () > 0)
+			{
+				*(uint32_t *)(payload + size) = htobe32 (leases[0].tunnelID);
+				size += 4; // reply tunnelID
+				memcpy (payload + size, leases[0].tunnelGateway, 32);
+				size += 32; // reply tunnel gateway
+			}
+			else
+				msg->replyToken = 0;
+		}
+		memcpy (payload + size, leaseSet->GetBuffer (), leaseSet->GetBufferLen ());
+		size += leaseSet->GetBufferLen ();
+		m->len += size;
 		FillI2NPMessageHeader (m, eI2NPDatabaseStore);
 		return m;
 	}
@@ -248,7 +264,7 @@ namespace i2p
 		if (isEndpoint) clearText.flag |= 0x40;
 		memcpy (clearText.ourIdent, ourIdent, 32);
 		memcpy (clearText.nextIdent, nextIdent, 32);
-		clearText.requestTime = i2p::util::GetHoursSinceEpoch (); 
+		clearText.requestTime = htobe32 (i2p::util::GetHoursSinceEpoch ()); 
 		clearText.nextMessageID = htobe32(nextMessageID);
 		return clearText;
 	}	
@@ -310,13 +326,11 @@ namespace i2p
 			if (tunnel->HandleTunnelBuildResponse (buf, len))
 			{
 				LogPrint ("Inbound tunnel ", tunnel->GetTunnelID (), " has been created");
+				tunnel->SetState (i2p::tunnel::eTunnelStateEstablished);	
 				i2p::tunnel::tunnels.AddInboundTunnel (static_cast<i2p::tunnel::InboundTunnel *>(tunnel));
 			}
 			else
-			{
 				LogPrint ("Inbound tunnel ", tunnel->GetTunnelID (), " has been declined");
-				delete tunnel;
-			}	
 		}
 		else
 		{
@@ -368,14 +382,11 @@ namespace i2p
 			if (tunnel->HandleTunnelBuildResponse (buf, len))
 			{	
 				LogPrint ("Outbound tunnel ", tunnel->GetTunnelID (), " has been created");
+				tunnel->SetState (i2p::tunnel::eTunnelStateEstablished);	
 				i2p::tunnel::tunnels.AddOutboundTunnel (static_cast<i2p::tunnel::OutboundTunnel *>(tunnel));
 			}	
 			else
-			{	
 				LogPrint ("Outbound tunnel ", tunnel->GetTunnelID (), " has been declined");
-				i2p::transports.CloseSession (tunnel->GetTunnelConfig ()->GetFirstHop ()->router);
-				delete tunnel;
-			}	
 		}	
 		else
 			LogPrint ("Pending tunnel for message ", replyMsgID, " not found");
@@ -535,7 +546,7 @@ namespace i2p
 				break;
 				case eI2NPGarlic:
 					LogPrint ("Garlic");
-					i2p::garlic::routing.HandleGarlicMessage (msg);
+					i2p::garlic::routing.PostI2NPMsg (msg);
 				break;
 				case eI2NPDatabaseStore:
 				case eI2NPDatabaseSearchReply:
@@ -548,10 +559,7 @@ namespace i2p
 					if (msg->from && msg->from->GetTunnelPool ())
 						msg->from->GetTunnelPool ()->ProcessDeliveryStatus (msg);
 					else
-					{
-						i2p::garlic::routing.HandleDeliveryStatusMessage (msg->GetPayload (), msg->GetLength ()); 
-						DeleteI2NPMessage (msg);
-					}			
+						i2p::garlic::routing.PostI2NPMsg (msg); 	
 				break;	
 				default:
 					HandleI2NPMessage (msg->GetBuffer (), msg->GetLength ());

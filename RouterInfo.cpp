@@ -237,30 +237,45 @@ namespace data
 		{
 			switch (*cap)
 			{
-				case 'f':
+				case CAPS_FLAG_FLOODFILL:
 					m_Caps |= Caps::eFloodfill;
 				break;
-				case 'M':
-				case 'N':
-				case 'O':
+				case CAPS_FLAG_HIGH_BANDWIDTH1:
+				case CAPS_FLAG_HIGH_BANDWIDTH2:
+				case CAPS_FLAG_HIGH_BANDWIDTH3:
 					m_Caps |= Caps::eHighBandwidth;
 				break;
-				case 'R':
+				case CAPS_FLAG_HIDDEN:
+					m_Caps |= Caps::eHidden;
+				break;	
+				case CAPS_FLAG_REACHABLE:
 					m_Caps |= Caps::eReachable;
 				break;
-				case 'B':
+				case CAPS_FLAG_UNREACHABLE:
+					m_Caps |= Caps::eUnreachable;
+				break;	
+				case CAPS_FLAG_SSU_TESTING:
 					m_Caps |= Caps::eSSUTesting;
 				break;	
-				case 'C':
+				case CAPS_FLAG_SSU_INTRODUCER:
 					m_Caps |= Caps::eSSUIntroducer;
-				break;	
-				case 'H':
-					m_Caps |= Caps::eHidden;
 				break;	
 				default: ;
 			}	
 			cap++;
 		}
+	}
+
+	void RouterInfo::UpdateCapsProperty ()
+	{	
+		std::string caps;
+		caps += (m_Caps & eHighBandwidth) ? CAPS_FLAG_HIGH_BANDWIDTH1 : CAPS_FLAG_LOW_BANDWIDTH2; // bandwidth
+		if (m_Caps & eFloodfill) caps += CAPS_FLAG_FLOODFILL; // floodfill
+		if (m_Caps & eHidden) caps += CAPS_FLAG_HIDDEN; // hidden
+		if (m_Caps & eReachable) caps += CAPS_FLAG_REACHABLE; // reachable
+		if (m_Caps & eUnreachable) caps += CAPS_FLAG_UNREACHABLE; // unreachable
+
+		SetProperty ("caps", caps.c_str ());
 	}
 
 	void RouterInfo::UpdateIdentHashBase64 ()
@@ -299,8 +314,8 @@ namespace data
 				WriteString ("caps", properties);
 				properties << '=';
 				std::string caps;
-				if (IsPeerTesting ()) caps += 'B';
-				if (IsIntroducer ()) caps += 'C';
+				if (IsPeerTesting ()) caps += CAPS_FLAG_SSU_TESTING;
+				if (IsIntroducer ()) caps += CAPS_FLAG_SSU_INTRODUCER;
 				WriteString (caps, properties);
 				properties << ';';
 			}	
@@ -313,7 +328,50 @@ namespace data
 			properties << ';';
 			if (address.transportStyle == eTransportSSU)
 			{
-				// wtite intro key
+				// write introducers if any
+				if (address.introducers.size () > 0)
+				{	
+					int i = 0;
+					for (auto introducer: address.introducers)
+					{
+						WriteString ("ihost" + boost::lexical_cast<std::string>(i), properties);
+						properties << '=';
+						WriteString (introducer.iHost.to_string (), properties);
+						properties << ';';
+						i++;
+					}	
+					i = 0;
+					for (auto introducer: address.introducers)
+					{
+						WriteString ("ikey" + boost::lexical_cast<std::string>(i), properties);
+						properties << '=';
+						char value[64];
+						size_t l = ByteStreamToBase64 (introducer.iKey, 32, value, 64);
+						value[l] = 0;
+						WriteString (value, properties);
+						properties << ';';
+						i++;
+					}	
+					i = 0;
+					for (auto introducer: address.introducers)
+					{
+						WriteString ("iport" + boost::lexical_cast<std::string>(i), properties);
+						properties << '=';
+						WriteString (boost::lexical_cast<std::string>(introducer.iPort), properties);
+						properties << ';';
+						i++;
+					}	
+					i = 0;
+					for (auto introducer: address.introducers)
+					{
+						WriteString ("itag" + boost::lexical_cast<std::string>(i), properties);
+						properties << '=';
+						WriteString (boost::lexical_cast<std::string>(introducer.iTag), properties);
+						properties << ';';
+						i++;
+					}	
+				}	
+				// write intro key
 				WriteString ("key", properties);
 				properties << '=';
 				char value[64];
@@ -360,7 +418,7 @@ namespace data
 		return m_Buffer; 
 	}
 
-	void RouterInfo::CreateBuffer ()
+	void RouterInfo::CreateBuffer (const PrivateKeys& privateKeys)
 	{
 		m_Timestamp = i2p::util::GetMillisecondsSinceEpoch (); // refresh timstamp
 		std::stringstream s;
@@ -370,8 +428,8 @@ namespace data
 			m_Buffer = new uint8_t[MAX_RI_BUFFER_SIZE];
 		memcpy (m_Buffer, s.str ().c_str (), m_BufferLen);
 		// signature
-		i2p::context.Sign ((uint8_t *)m_Buffer, m_BufferLen, (uint8_t *)m_Buffer + m_BufferLen);
-		m_BufferLen += 40;
+		privateKeys.Sign ((uint8_t *)m_Buffer, m_BufferLen, (uint8_t *)m_Buffer + m_BufferLen);
+		m_BufferLen += privateKeys.GetPublic ().GetSignatureLen ();
 	}	
 
 	void RouterInfo::SaveToFile (const std::string& fullPath)
@@ -428,6 +486,56 @@ namespace data
 		m_Caps |= eSSUTesting; 
 		m_Caps |= eSSUIntroducer; 
 	}	
+
+	bool RouterInfo::AddIntroducer (const Address * address, uint32_t tag)
+	{
+		for (auto& addr : m_Addresses)
+		{
+			if (addr.transportStyle == eTransportSSU && addr.host.is_v4 ())
+			{	
+				for (auto intro: addr.introducers)
+					if (intro.iTag == tag) return false; // already presented
+				Introducer x;
+				x.iHost = address->host;
+				x.iPort = address->port;
+				x.iTag = tag;
+				memcpy (x.iKey, address->key, 32); // TODO: replace to Tag<32>
+				addr.introducers.push_back (x);
+				return true;
+			}	
+		}	
+		return false;
+	}	
+
+	bool RouterInfo::RemoveIntroducer (uint32_t tag)
+	{		
+		for (auto& addr : m_Addresses)
+		{
+			if (addr.transportStyle == eTransportSSU && addr.host.is_v4 ())
+			{	
+				for (std::vector<Introducer>::iterator it = addr.introducers.begin (); it != addr.introducers.begin (); it++)
+					if (it->iTag == tag) 
+					{
+						addr.introducers.erase (it);
+						return true;
+					}	
+			}	
+		}	
+		return false;
+	}
+
+	void RouterInfo::SetCaps (uint8_t caps)
+	{
+		m_Caps = caps;
+		UpdateCapsProperty ();
+	}
+		
+	void RouterInfo::SetCaps (const char * caps)
+	{
+		SetProperty ("caps", caps);
+		m_Caps = 0;
+		ExtractCaps (caps);
+	}	
 		
 	void RouterInfo::SetProperty (const char * key, const char * value)
 	{
@@ -465,7 +573,7 @@ namespace data
 
 	bool RouterInfo::UsesIntroducer () const
 	{
-		return !(m_Caps & Caps::eReachable); // non-reachable
+		return m_Caps & Caps::eUnreachable; // non-reachable
 	}		
 		
 	const RouterInfo::Address * RouterInfo::GetNTCPAddress (bool v4only) const

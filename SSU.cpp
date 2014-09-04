@@ -87,7 +87,8 @@ namespace ssu
 		{
 			if (m_State == eSessionStateEstablished)
 				ScheduleTermination ();
-
+			
+			if (!len) return; // ignore zero-length packets	
 			if (m_IsSessionKey && Validate (buf, len, m_MacKey)) // try session key first
 				DecryptSessionKey (buf, len);	
 			else 
@@ -109,7 +110,7 @@ namespace ssu
 						Decrypt (buf, len, address->key);
 					else
 					{
-						LogPrint ("MAC verifcation failed");
+						LogPrint ("MAC verification failed ", len, " bytes from ", senderEndpoint);
 						m_Server.DeleteSession (this); 
 						return;
 					}	
@@ -314,7 +315,7 @@ namespace ssu
 			rnd.GenerateWord32 (relayTag);
 			m_Server.AddRelay (relayTag, m_RemoteEndpoint);
 		}
-		*(uint32_t *)(payload) = relayTag; 
+		*(uint32_t *)(payload) = htobe32 (relayTag); 
 		payload += 4; // relay tag 
 		*(uint32_t *)(payload) = htobe32 (i2p::util::GetSecondsSinceEpoch ()); // signed on time
 		payload += 4;
@@ -690,6 +691,11 @@ namespace ssu
 
 	void SSUSession::SendI2NPMessage (I2NPMessage * msg)
 	{
+		m_Server.GetService ().post (boost::bind (&SSUSession::PostI2NPMessage, this, msg));    
+	}	
+
+	void SSUSession::PostI2NPMessage (I2NPMessage * msg)
+	{
 		if (msg)
 		{	
 			if (m_State == eSessionStateEstablished)
@@ -697,8 +703,8 @@ namespace ssu
 			else
 				m_DelayedMessages.push_back (msg);
 		}	
-	}	
-	
+	}		
+		
 	void SSUSession::ProcessData (uint8_t * buf, size_t len)
 	{
 		m_Data.ProcessMessage (buf, len);
@@ -755,12 +761,16 @@ namespace ssu
 			else
 			{
 				LogPrint ("SSU peer test from Alice. We are Bob");
-				// TODO: find Charlie
+				auto session = m_Server.GetRandomEstablishedSession (); // charlie
+				if (session)
+					session->SendPeerTest (nonce, senderEndpoint.address ().to_v4 ().to_ulong (),
+						senderEndpoint.port (), introKey, false); 		
 			}
 		}	
 	}
 	
-	void SSUSession::SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, uint8_t * introKey)
+	void SSUSession::SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, 
+		uint8_t * introKey, bool toAddress)
 	{
 		uint8_t buf[80 + 18];
 		uint8_t iv[16];
@@ -771,16 +781,25 @@ namespace ssu
 		payload++; // size
 		*(uint32_t *)payload = htobe32 (address);
 		payload += 4; // address
-		*(uint16_t *)payload = htobe32 (port);
+		*(uint16_t *)payload = htobe16 (port);
 		payload += 2; // port
 		memcpy (payload, introKey, 32); // intro key
 
 		CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
 		rnd.GenerateBlock (iv, 16); // random iv
-		// encrypt message with specified intro key
-		FillHeaderAndEncrypt (PAYLOAD_TYPE_PEER_TEST, buf, 80, introKey, iv, introKey);
-		boost::asio::ip::udp::endpoint e (boost::asio::ip::address_v4 (address), port);
-		m_Server.Send (buf, 80, e);
+		if (toAddress)
+		{	
+			// encrypt message with specified intro key
+			FillHeaderAndEncrypt (PAYLOAD_TYPE_PEER_TEST, buf, 80, introKey, iv, introKey);
+			boost::asio::ip::udp::endpoint e (boost::asio::ip::address_v4 (address), port);
+			m_Server.Send (buf, 80, e);
+		}	
+		else
+		{
+			// encrypt message with session key
+			FillHeaderAndEncrypt (PAYLOAD_TYPE_PEER_TEST, buf, 80);
+			Send (buf, 80);
+		}	
 	}	
 
 	void SSUSession::SendPeerTest ()
@@ -820,7 +839,7 @@ namespace ssu
 			// encrypt message with session key
 			FillHeaderAndEncrypt (PAYLOAD_TYPE_SESSION_DESTROYED, buf, 48);
 			Send (buf, 48);
-			LogPrint ("SSU session destoryed sent");
+			LogPrint ("SSU session destroyed sent");
 		}
 	}	
 
@@ -1051,6 +1070,30 @@ namespace ssu
 			delete it.second;			
 		}	
 		m_Sessions.clear ();
+	}
+
+	template<typename Filter>
+	SSUSession * SSUServer::GetRandomSession (Filter filter)
+	{
+		std::vector<SSUSession *> filteredSessions;
+		for (auto s :m_Sessions)
+			if (filter (s.second)) filteredSessions.push_back (s.second);
+		if (filteredSessions.size () > 0)
+		{
+			auto ind = i2p::context.GetRandomNumberGenerator ().GenerateWord32 (0, filteredSessions.size ()-1);
+			return filteredSessions[ind];
+		}
+		return nullptr;	
+	}
+
+	SSUSession * SSUServer::GetRandomEstablishedSession ()
+	{
+		return GetRandomSession (
+				[](SSUSession * session)->bool 
+				{ 
+					return session->GetState () == eSessionStateEstablished; 
+				}
+								);
 	}
 }
 }

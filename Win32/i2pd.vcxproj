@@ -16,7 +16,6 @@
     <ClCompile Include="..\base64.cpp" />
     <ClCompile Include="..\CryptoConst.cpp" />
     <ClCompile Include="..\Daemon.cpp" />
-    <ClCompile Include="..\DaemonLinux.cpp" />
     <ClCompile Include="..\DaemonWin32.cpp" />
     <ClCompile Include="..\Garlic.cpp" />
     <ClCompile Include="..\HTTPProxy.cpp" />
@@ -84,6 +83,8 @@
     <ClInclude Include="..\util.h" />
     <ClInclude Include="..\SOCKS.h" />
 	<ClInclude Include="..\I2PTunnel.h" />
+	<ClInclude Include="..\version.h" />
+	<ClInclude Include="..\Signature.h" />
     <ClInclude Include="Win32Service.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">

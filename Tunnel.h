@@ -22,13 +22,17 @@ namespace i2p
 namespace tunnel
 {	
 	const int TUNNEL_EXPIRATION_TIMEOUT = 660; // 11 minutes	
+	const int TUNNEL_EXPIRATION_THRESHOLD = 60; // 1 minute	
+	const int TUNNEL_CREATION_TIMEOUT = 20; // 20 seconds
+	const int STANDARD_NUM_RECORDS = 5; // in VariableTunnelBuild message
 
 	enum TunnelState
 	{
 		eTunnelStatePending,
 		eTunnelStateEstablished,
 		eTunnelStateTestFailed,
-		eTunnelStateFailed
+		eTunnelStateFailed,
+		eTunnelStateExpiring
 	};	
 	
 	class OutboundTunnel;
@@ -144,7 +148,9 @@ namespace tunnel
 			uint32_t m_NextReplyMsgID; // TODO: make it random later
 			std::thread * m_Thread;	
 			std::map<uint32_t, Tunnel *> m_PendingTunnels; // by replyMsgID
+			std::mutex m_InboundTunnelsMutex;
 			std::map<uint32_t, InboundTunnel *> m_InboundTunnels;
+			std::mutex m_OutboundTunnelsMutex;
 			std::list<OutboundTunnel *> m_OutboundTunnels;
 			std::map<uint32_t, TransitTunnel *> m_TransitTunnels;
 			std::map<i2p::data::IdentHash, TunnelPool *> m_Pools;
